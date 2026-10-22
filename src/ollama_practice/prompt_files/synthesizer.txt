@@ -1,0 +1,7 @@
+Answer the question from the evidence below. Cite evidence by its bracket number
+such as [1]. If evidence conflicts, explain the conflict. If it is insufficient,
+say what is missing.
+
+Question: {question}
+Evidence:
+{evidence}

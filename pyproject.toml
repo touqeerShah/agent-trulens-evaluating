@@ -1,13 +1,22 @@
 [project]
 name = "agent-trulens-evaluating"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local Ollama playground for practicing agent prompting and evaluation"
 readme = "README.md"
 authors = [
     { name = "s.touqeer@pharmatrace.io", email = "s.touqeer@pharmatrace.io" }
 ]
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "langgraph==0.5.4",
+    "setuptools<81",
+    "trulens-apps-langchain==2.2.1",
+    "trulens-apps-langgraph==2.2.1",
+    "trulens-core==2.2.1",
+    "trulens-dashboard==2.2.1",
+    "trulens-feedback==2.2.1",
+    "typing-extensions>=4.12",
+]
 
 [project.scripts]
 agent-trulens-evaluating = "agent_trulens_evaluating:main"

@@ -23,29 +23,21 @@ warnings.filterwarnings(
 
 import os
 import json
-import re
 from dotenv import load_dotenv
 from snowflake.snowpark import Session
 from langchain_core.tools import tool
 from langchain_experimental.utilities import PythonREPL
-from typing import Annotated, Literal, Optional, List, Dict, Any, Type
+from typing import Annotated, Literal, Optional, List, Dict, Any
 from trulens.otel.semconv.trace import SpanAttributes
 from trulens.core.otel.instrument import instrument
-from snowflake.core import Root
-from snowflake.core.cortex.lite_agent_service import AgentRunRequest
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from langchain.schema import HumanMessage
-from langgraph.graph import MessagesState, START, StateGraph, END
+from langgraph.graph import MessagesState, END
 from langgraph.types import Command
 from langgraph.prebuilt import create_react_agent
-from trulens.core import Feedback
-from trulens.core.feedback.selector import Selector
-from trulens.providers.openai import OpenAI
-import numpy as np
-from prompts import plan_prompt, executor_prompt, agent_system_prompt
-
+from prompte import plan_prompt, executor_prompt, agent_system_prompt
 os.environ["TRULENS_OTEL_TRACING"] = "1"
 
 # load full dotenv
@@ -231,111 +223,7 @@ def executor_node(
     return Command(update=updates, goto=goto)
 
 
-# Set semantic model file (for analyst) and search service name
-SEMANTIC_MODEL_FILE = "@sales_intelligence.data.models/sales_metrics_model.yaml"
-
-CORTEX_SEARCH_SERVICE = "sales_intelligence.data.sales_conversation_search"
-
-
-# ---- Agent Setup ----
-class CortexAgentArgs(BaseModel):
-    query: str
-
-
-class CortexAgentTool:
-    name: str = "CortexAgent"
-    description: str = "answers questions using sales conversations and metrics"
-    args_schema: Type[CortexAgentArgs] = CortexAgentArgs
-
-    _session: Session = PrivateAttr()
-    _root: Root = PrivateAttr()
-    _agent_service: Any = PrivateAttr()
-
-    def __init__(self, session: Session):
-        self._session = session
-        self._root = Root(session)
-        self._agent_service = self._root.cortex_agent_service
-
-    def _build_request(self, query: str) -> AgentRunRequest:
-        return AgentRunRequest.from_dict(
-            {
-                "model": "claude-3-5-sonnet",
-                "tools": [
-                    {
-                        "tool_spec": {
-                            "type": "cortex_analyst_text_to_sql",
-                            "name": "analyst1",
-                        }
-                    },
-                    {"tool_spec": {"type": "cortex_search", "name": "search1"}},
-                ],
-                "tool_resources": {
-                    "analyst1": {"semantic_model_file": SEMANTIC_MODEL_FILE},
-                    "search1": {
-                        "name": CORTEX_SEARCH_SERVICE,
-                        "max_results": 10,
-                        "id_column": "conversation_id",
-                    },
-                },
-                "messages": [
-                    {"role": "user", "content": [{"type": "text", "text": query}]}
-                ],
-            }
-        )
-
-    def _consume_stream(self, stream):
-        text, sql, citations = "", "", []
-        for evt in stream.events():
-            try:
-                delta = (
-                    evt.data.get("delta")
-                    if isinstance(evt.data, dict)
-                    else json.loads(evt.data).get("delta")
-                    or json.loads(evt.data).get("data", {}).get("delta")
-                )
-            except Exception:
-                continue
-
-            if not isinstance(delta, dict):
-                continue
-
-            for item in delta.get("content", []):
-                if item.get("type") == "text":
-                    text += item.get("text", "")
-                elif item.get("type") == "tool_results":
-                    for result in item["tool_results"].get("content", []):
-                        if result.get("type") != "json":
-                            continue
-                        j = result["json"]
-                        text += j.get("text", "")
-                        sql = j.get("sql", sql)
-                        citations.extend(
-                            {"source_id": s.get("source_id"), "doc_id": s.get("doc_id")}
-                            for s in j.get("searchResults", [])
-                        )
-        return text, sql, str(citations)
-
-    def run(self, query: str, **kwargs):
-        """
-        This agent will retrieve sales-related data from Snowflake using both Text2SQL and Semantic Search.
-        """
-        req = self._build_request(query)
-        stream = self._agent_service.run(req)
-        text, sql, citations = self._consume_stream(stream)
-
-        results_str = ""
-        if sql:
-            try:
-                # Ensure warehouse is set explicitly before running the SQL
-                self._session.sql("USE WAREHOUSE SALES_INTELLIGENCE_WH").collect()
-
-                df = self._session.sql(sql.rstrip(";")).to_pandas()
-                results_str = df.to_string(index=False)
-            except Exception as e:
-                results_str = f"SQL execution error: {e}"
-
-        return text, citations, sql, results_str
-
+from cortex_agent import CortexAgentTool
 
 cortex_agent_tool = CortexAgentTool(session=snowpark_session)
 
@@ -354,7 +242,6 @@ cortex_agent = create_react_agent(
         Do not take any further action.
     """),
 )
-
 
 @instrument(
     span_type=SpanAttributes.SpanType.RETRIEVAL,
@@ -403,8 +290,15 @@ web_search_agent = create_react_agent(
         Do NOT attempt to take further actions.
     """),
 )
-
-
+@instrument(
+    span_type=SpanAttributes.SpanType.RETRIEVAL,
+    attributes=lambda ret, exception, *args, **kwargs: {
+        SpanAttributes.RETRIEVAL.QUERY_TEXT: args[0].get("agent_query") if args[0].get("agent_query") else None,
+        SpanAttributes.RETRIEVAL.RETRIEVED_CONTEXTS: [
+            ret.update["messages"][-1].content
+        ] if hasattr(ret, "update") else "No tool call",
+    },
+)
 def web_research_node(
     state: State,
 ) -> Command[Literal["executor"]]:
@@ -558,161 +452,3 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
     )
 
 
-# Evaluations
-
-# Use GPT-4o for RAG Triad Evaluations
-provider = OpenAI(model_engine="gpt-4o")
-
-# Define a groundedness feedback function
-f_groundedness = (
-    Feedback(provider.groundedness_measure_with_cot_reasons, name="Groundedness")
-    .on(
-        {
-            "source": Selector(
-                span_type=SpanAttributes.SpanType.RETRIEVAL,
-                span_attribute=SpanAttributes.RETRIEVAL.RETRIEVED_CONTEXTS,
-                collect_list=True,
-            )
-        }
-    )
-    .on_output()
-)
-
-# Question/answer relevance between overall question and answer.
-f_answer_relevance = (
-    Feedback(provider.relevance_with_cot_reasons, name="Answer Relevance")
-    .on_input()
-    .on_output()
-)
-
-# Context relevance between question and each context chunk.
-f_context_relevance = (
-    Feedback(provider.context_relevance_with_cot_reasons, name="Context Relevance")
-    .on(
-        {
-            "question": Selector(
-                span_type=SpanAttributes.SpanType.RETRIEVAL,
-                span_attribute=SpanAttributes.RETRIEVAL.QUERY_TEXT,
-            )
-        }
-    )
-    .on(
-        {
-            "context": Selector(
-                span_type=SpanAttributes.SpanType.RETRIEVAL,
-                span_attribute=SpanAttributes.RETRIEVAL.RETRIEVED_CONTEXTS,
-                collect_list=False,
-            )
-        }
-    )
-    .aggregate(np.mean)
-)
-
-# Use GPT-4.1 for Goal-Plan-Act
-gpa_eval_provider = OpenAI(model_engine="gpt-4.1")
-
-# Goal-Plan-Act: Logical consistency of trace
-f_logical_consistency = Feedback(
-    gpa_eval_provider.logical_consistency_with_cot_reasons,
-    name="Logical Consistency",
-).on(
-    {
-        "trace": Selector(trace_level=True),
-    }
-)
-
-# Goal-Plan-Act: Execution efficiency of trace
-f_execution_efficiency = Feedback(
-    gpa_eval_provider.execution_efficiency_with_cot_reasons,
-    name="Execution Efficiency",
-).on(
-    {
-        "trace": Selector(trace_level=True),
-    }
-)
-
-# Goal-Plan-Act: Plan adherence
-f_plan_adherence = Feedback(
-    gpa_eval_provider.plan_adherence_with_cot_reasons,
-    name="Plan Adherence",
-).on(
-    {
-        "trace": Selector(trace_level=True),
-    }
-)
-
-# Goal-Plan-Act: Plan quality
-f_plan_quality = Feedback(
-    gpa_eval_provider.plan_quality_with_cot_reasons,
-    name="Plan Quality",
-).on(
-    {
-        "trace": Selector(trace_level=True),
-    }
-)
-
-from IPython.display import HTML, display
-
-
-def display_eval_reason(text, width=800):
-    # Strip any trailing "Score: X" from the end of the text
-    raw_text = str(text).rstrip()
-    cleaned_text = re.sub(
-        r"\s*Score:\s*-?\d+(?:\.\d+)?\s*$", "", raw_text, flags=re.IGNORECASE
-    )
-    # Convert newlines to HTML line breaks, then wrap
-    html_text = cleaned_text.replace("\n", "<br><br>")
-    display(
-        HTML(
-            f'<div style="font-size: 15px; word-wrap: break-word; width: {width}px;">{html_text}</div>'
-        )
-    )
-
-
-from langgraph.graph import START, StateGraph
-workflow = StateGraph(State)
-workflow.add_node("planner", planner_node)
-workflow.add_node("executor", executor_node)
-workflow.add_node("web_researcher", web_research_node)
-workflow.add_node("cortex_researcher", cortex_agents_research_node)
-workflow.add_node("chart_generator", chart_node)
-workflow.add_node("chart_summarizer", chart_summary_node)
-workflow.add_node("synthesizer", synthesizer_node)
-
-workflow.add_edge(START, "planner")
-
-graph = workflow.compile()
-
-from IPython.display import Image, display
-
-display(Image(graph.get_graph().draw_png()))
-
-from langchain.schema import HumanMessage
-import json
-
-query = "Chart the current market capitalization of the top 5 banks in the US?"
-print(f"Query: {query}")
-
-state = {
-            "messages": [HumanMessage(content=query)],
-            "user_query": query,
-            "enabled_agents": ["web_researcher", "chart_generator", 
-                               "chart_summarizer", "synthesizer"],
-        }
-graph.invoke(state)
-
-print("--------------------------------")
-
-
-query = "Identify current regulatory changes for the financial services industry in the US."
-print(f"Query: {query}")
-
-state = {
-            "messages": [HumanMessage(content=query)],
-            "user_query": query,
-            "enabled_agents": ["web_researcher", "chart_generator", 
-                               "chart_summarizer", "synthesizer"],
-        }
-graph.invoke(state)
-
-print("--------------------------------")

@@ -1,0 +1,10 @@
+You extract facts from context.
+Return JSON only with exactly these keys:
+"answer" (string), "evidence" (list of strings), "confidence" (number from 0 to 1).
+Do not invent evidence.
+
+Context:
+{context}
+
+Question:
+{question}
